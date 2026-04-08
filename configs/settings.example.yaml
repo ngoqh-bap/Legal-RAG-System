@@ -1,0 +1,16 @@
+app:
+  name: legal-rag
+
+paths:
+  default_corpus_path: data/processed/corpus.jsonl
+
+providers:
+  embeddings: local_hash
+  llm: local_extractive
+
+ingest:
+  chunk_size: 900
+  chunk_overlap: 150
+
+retrieval:
+  top_k: 5
