@@ -21,6 +21,9 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.5",
 ]
+hf = [
+  "datasets>=2.19",
+]
 pdf = [
   "pypdf>=4.2",
 ]

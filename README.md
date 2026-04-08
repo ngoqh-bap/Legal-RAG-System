@@ -21,6 +21,18 @@ legal-rag --help
 
 1) Put some `.txt` files into `data/raw/` (example: `data/raw/contract.txt`).
 
+You can also pull raw source documents from Hugging Face datasets into `data/raw/`:
+
+```bash
+pip install -e ".[hf]"
+
+# Download to: data/raw/hf/th1nhng0__vietnamese-legal-documents/default/<split>.jsonl
+python scripts/hf_download_to_raw.py --dataset "th1nhng0/vietnamese-legal-documents"
+
+# Download to: data/raw/hf/fcsn37__vietnamese-stopwords/default/<split>.jsonl
+python scripts/hf_download_to_raw.py --dataset "fcsn37/vietnamese-stopwords"
+```
+
 2) Ingest and query:
 
 ```bash
