@@ -38,6 +38,9 @@ todos:
   - id: fastapi-gradio-product
     content: Specify FastAPI endpoints + Gradio UI flows (over HTTP) that preserve citations, maintain continuous session context, and produce exportable audit artifacts.
     status: pending
+  - id: performance-efficiency
+    content: Add performance-first defaults (caching, two-stage retrieval, batching, SQLite WAL/indexes, and strict context budgets) to keep the system affordable and fast.
+    status: pending
 isProject: false
 ---
 
@@ -81,6 +84,84 @@ flowchart TD
   LLMRepository --> LLM
 
   PromptProcessing -->|"RunManifests"| Reports[EvalReports_Audit]
+```
+
+## Full project flow (data → server → client → response)
+
+```mermaid
+flowchart TD
+  subgraph dataPlane [DataPlane_Artifacts]
+    parquet[ParquetDataset]
+    canonical[CanonicalDocs_jsonl]
+    chunks[Chunks_jsonl]
+    docstore[Docstore_sqlite_or_jsonl]
+    vecIndex[VectorIndex_FAISS_or_other]
+    indexManifest[IndexManifest_json]
+  end
+
+  subgraph serverPlane [ServerPlane_FastAPI]
+    api[FastAPIService]
+    ingestJob[IngestJobRunner]
+    indexBuilder[IndexBuilder]
+    sessionSvc[SessionService]
+    retrievalSvc[RetrievalService_Hybrid]
+    reranker[Reranker_GPU_optional]
+    generator[LLM_Generator_Ollama_default]
+    contextPacker[ContextPacker_Budgets]
+    cache[IndexCache_LRU]
+    stopwords[StopwordsSet_VN]
+    vnSeg[VN_Segmenter_Tokenizer]
+    sqlite[(SQLite_DefaultStore)]
+    runAudit[RunAudit_Manifests]
+  end
+
+  subgraph clientPlane [ClientPlane_Gradio]
+    ui[GradioUI]
+    state[ClientState_session_id]
+  end
+
+  %% Build artifacts (offline/async)
+  parquet --> ingestJob --> canonical --> chunks
+  chunks --> indexBuilder --> vecIndex
+  chunks --> indexBuilder --> docstore
+  indexBuilder --> indexManifest
+
+  %% Server startup (warm init)
+  api --> stopwords
+  api --> vnSeg
+  api --> cache
+  api --> sqlite
+
+  %% Session lifecycle
+  ui -->|"HTTP: POST /sessions"| api
+  api --> sessionSvc --> sqlite
+  ui --> state
+  api -->|"returns session_id"| ui
+
+  %% Ask turn (continuous context)
+  ui -->|"HTTP: POST /sessions/{id}/ask (question)"| api
+  api --> sessionSvc
+  sessionSvc -->|"load summary+recent turns"| sqlite
+  api --> retrievalSvc
+  retrievalSvc --> vnSeg
+  retrievalSvc --> stopwords
+  retrievalSvc --> cache
+  cache -->|"load by index_manifest_id"| vecIndex
+  cache --> docstore
+  retrievalSvc --> reranker
+  retrievalSvc -->|"topK_chunks+scores"| contextPacker
+  sessionSvc -->|"summary+recent turns"| contextPacker
+  contextPacker -->|"packed contexts"| generator
+  generator -->|"answer_text"| api
+
+  %% Persist + respond
+  api -->|"write turn+citations+run_id"| sqlite
+  api --> runAudit
+  runAudit --> sqlite
+  api -->|"response: answer+citations+run_id"| ui
+
+  %% Optional exports
+  sqlite -->|"export bundles (JSONL/zip)"| runAudit
 ```
 
 **How this maps to phases**:
@@ -167,9 +248,15 @@ flowchart TD
     - Chroma (local persistent) for convenience
     - SQLite/duckdb + HNSW (advanced)
 - **Strategies**:
+  - **Persisted artifacts (affordable)**:
+    - Build the vector index and docstore once and persist them; do not recompute embeddings at query time.
+    - Treat `index_manifest_id` as the canonical handle for loading/caching an index in the server.
   - **Deterministic builds**: pin model versions; store model name + commit hash.
   - **Metadata filtering**: store fields required for later filters (jurisdiction/date/doc_type).
   - **GPU batching**: embed chunks in batches sized to GPU VRAM; checkpoint progress for large corpora.
+  - **Batching + amortization**:
+    - Index-time: batch embeddings for throughput (largest win).
+    - Query-time: only embed the query once per request/session-turn.
   - **Incremental indexing**: append new Parquet partitions/matters without full rebuild; update `index_manifest.json` with segment lineage.
 
 ## Phase 4 — Retrieval (hybrid, legal tuned)
@@ -183,8 +270,20 @@ flowchart TD
   - LangChain retrievers
   - BM25 lexical retriever (local) as complement (e.g., `rank-bm25`) with Vietnamese segmentation
 - **Strategies**:
+  - **Vietnamese stopwords (efficiency + quality)**:
+    - Use the Vietnamese-only stopword dataset (Parquet) as an input to the lexical retrieval path.
+    - Apply stopword filtering to **BM25 token streams** (index-time and query-time) to reduce noise and improve efficiency.
+    - Do **not** remove stopwords from the original chunk text used for citations/LLM contexts (legal accuracy + faithful quoting).
+    - Implementation note (server efficiency): load stopwords once at FastAPI startup into an in-memory `set[str]` and reuse across requests.
+  - **Precompute lexical fields (efficiency)**:
+    - Store a derived `bm25_text` per chunk: normalized + VN-segmented + stopword-filtered.
+    - Keep original chunk text unchanged for citations and generation context.
   - **Hybrid retrieval**: vector + BM25, then fuse (RRF).
+  - **Two-stage retrieval (biggest affordable win)**:
+    - Stage 1 (cheap recall): vector + BM25 to produce a broad candidate set (e.g., 50–200).
+    - Stage 2 (expensive precision): rerank only the top N candidates (e.g., 50) and return final top_k (e.g., 8).
   - **Query rewriting (VN legal)**: normalize variants like `điều/Điều`, `khoản`, `điểm`; expand common Vietnamese legal synonyms; preserve exact citations when query contains “Điều X” patterns.
+    - For BM25 only: create a stopword-filtered query token list; keep the original query for embedding + generation.
   - **Reranking (Vietnamese priority)**: GPU reranker with strong Vietnamese/multilingual performance (e.g., `BAAI/bge-reranker-v2-m3`) and boosts for metadata matches on `Điều/Khoản/Điểm`.
 
 ## Phase 5 — Generation (local LLM) + citation grounding
@@ -201,7 +300,10 @@ flowchart TD
   - LangChain chat model wrappers for Ollama / llama.cpp.
 - **Strategies**:
   - **Strict prompt contract**: answer must quote/cite chunk IDs; if insufficient evidence, say so.
-  - **Context packing**: prioritize by (rerank score, diversity across docs, clause boundaries).
+  - **Context packing (efficiency + quality)**:
+    - Prioritize by (rerank score, diversity across docs, clause boundaries).
+    - Deduplicate near-identical chunks and cap total context size deterministically (char/token budget).
+    - Prefer including fewer, higher-signal chunks over many overlapping ones.
   - **Safety**: disclaimers (“not legal advice”), refusal logic for unsupported questions.
   - **Vietnamese output policy**: answer in Vietnamese by default; preserve legal terminology; when possible cite using `Điều/Khoản/Điểm` fields from chunk metadata.
 
@@ -241,6 +343,9 @@ flowchart TD
   - **Context packing budgets**:
     - Define budgets for: recent turns, summary, retrieved chunks, and system/policy text.
     - Prefer including: (1) running summary, (2) last N turns, (3) top retrieved chunks, (4) optional cited-memory facts.
+  - **Cited-memory (affordable storage + better grounding)**:
+    - Persist references to `chunk_id`s used in answers (and optionally short quoted spans), not large copied text blobs.
+    - When packing context for follow-ups, prefer cited-memory pointers + fresh retrieval over replaying full past passages.
 
 ## Phase 6 — Evaluation & quality gates (offline)
 - **Goal**: measure retrieval and answer quality for legal tasks.
@@ -316,6 +421,15 @@ flowchart TD
   - **Deterministic responses** (where possible): include `run_id`, `index_manifest_id`, and `config_hash`.
   - **Guardrails as middleware**: enforce input/output policies at the boundary (Phase 5A) and record decisions in `run_manifest.json`.
   - **Index reuse**: keep vector index/cache in-process keyed by `(corpus/index_manifest_id, embedder_config)` and reuse across requests; avoid rebuild-per-turn.
+  - **Stopwords efficiency**: load the Vietnamese stopword list once (from Parquet) at server startup, cache as a `set[str]`, and reuse for BM25/query preprocessing.
+  - **Warm startup (avoid per-request init)**:
+    - Initialize heavy objects once: stopwords set, VN segmenter/tokenizer, embedding model handle, reranker handle, and any prompt templates.
+  - **Index cache policy (affordable memory use)**:
+    - Use an LRU cache for loaded indexes keyed by `index_manifest_id`.
+    - Evict least-recently-used indexes when exceeding a configured memory/entry limit.
+  - **SQLite performance defaults (server store)**:
+    - Enable WAL mode, use sensible busy timeouts, and add indexes for hot paths (`sessions`, `session_turns`, `runs`, `run_citations`).
+    - Batch writes per request (single transaction per `/sessions/{id}/ask`).
 
 ### Phase 7B — Gradio frontend (local-first analyst UI)
 - **Goal**: provide a fast iteration UI for legal analysts without coupling UI logic to core RAG code.
